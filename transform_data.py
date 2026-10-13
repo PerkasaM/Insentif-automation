@@ -7,7 +7,7 @@ Alur:
   2. Baca tiap file, BUANG BARIS KUNING (subtotal & grand total), cek total vs grand total
   3. Gabung semua file jadi satu
   4. Transform (dari etl_insentif): clean SDO, drop SO DATE invalid, NET VALUE2,
-     CYCLE, BRAND/PG/SUBPG, CHANNEL/SPV/ASM/RSM, REMARKS
+     CYCLE, BRAND/PG/SUBPG, CHANNEL (dari customer), SPV/ASM/RSM (dari SDO), REMARKS
   5. Simpan: output\\Raw data by finance 1 April - 30 September.xlsx
      (rentang tanggal diambil dari ACTUAL PGI DATE di dalam data)
 
@@ -57,6 +57,8 @@ FILE_CUST = DATA_DIR / "master c09.xlsx"
 SHEET_CYCLE = "Sheet2"
 SHEET_SKU_MASTER = "MASTERDATA"
 SHEET_CUST = "Sheet1"
+FILE_SPV = DATA_DIR / "spv rsm.xlsx"            # lookup SDO -> SPV, ASM, RSM
+SHEET_SPV = "Sheet2"
 
 # --- Aturan bisnis ---
 PPN = 1.11
@@ -225,6 +227,14 @@ def cleaning_sdo_global(s):
         return None
     if "ANDY WIJAYA" in s:
         return "ANDY"
+    elif "RIZAL ECOM" in s:
+        return "ECOMMERCE"
+    elif "ARDIAN DWI P." in s:
+        return "ARDIAN DWI P"
+    elif "AHMAD IMAM TAUFIQ" in s:
+        return "IMAM TAUFIQ"
+    elif "ARDI YULI KURNAWAN" in s:
+        return "ARDI YULI KURNIAWAN"
     elif "IMAM SHOVI" in s:
         return "IMAM SHOVII"
     elif "OKTO" in s:
@@ -303,11 +313,22 @@ def _prepare_sku_master(sku_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _prepare_cust(cust_df: pd.DataFrame) -> pd.DataFrame:
-    c = cust_df[["Customer Code", "Chanel", "SPV", "ASM", "RSM"]].copy()
-    c.columns = ["CUSTOMER#", "CHANNEL_SRC", "SPV_SRC", "ASM_SRC", "RSM_SRC"]
+    """Master customer -> CHANNEL per CUSTOMER#."""
+    c = cust_df[["Customer Code", "Chanel"]].copy()
+    c.columns = ["CUSTOMER#", "CHANNEL_SRC"]
     c["CUSTOMER#"] = c["CUSTOMER#"].astype(str).str.strip()
     c = c.dropna(subset=["CUSTOMER#"])
     return c.drop_duplicates(subset=["CUSTOMER#"], keep="first").reset_index(drop=True)
+
+
+def _prepare_spv(spv_df: pd.DataFrame) -> pd.DataFrame:
+    """Lookup spv_rsm.xlsx: SDO -> SPV, ASM, RSM (nilai 'BLANK' dibiarkan apa adanya)."""
+    s = spv_df[["SDO", "spv", "asm", "rsm"]].copy()
+    s.columns = ["SDO", "SPV_SRC", "ASM_SRC", "RSM_SRC"]
+    s = s.dropna(subset=["SDO"])
+    s["_SDO_KEY"] = s["SDO"].astype(str).str.strip().str.upper()
+    s = s.drop(columns=["SDO"])
+    return s.drop_duplicates(subset=["_SDO_KEY"], keep="first").reset_index(drop=True)
 
 
 def _classify_remarks(netvalue2: float):
@@ -322,14 +343,15 @@ def _classify_remarks(netvalue2: float):
 
 
 def load_masters() -> dict:
-    print("   Membaca master data (cycle, SKU, customer)...")
-    for f in (FILE_CYCLE, FILE_SKU, FILE_CUST):
+    print("   Membaca master data (cycle, SKU, customer, SPV/ASM/RSM)...")
+    for f in (FILE_CYCLE, FILE_SKU, FILE_CUST, FILE_SPV):
         if not f.exists():
             raise FileNotFoundError(f"File master tidak ditemukan: {f}")
     return {
         "cycle": pd.read_excel(FILE_CYCLE, sheet_name=SHEET_CYCLE, engine="openpyxl"),
         "sku_master": pd.read_excel(FILE_SKU, sheet_name=SHEET_SKU_MASTER, engine="openpyxl"),
         "cust": pd.read_excel(FILE_CUST, sheet_name=SHEET_CUST, engine="openpyxl"),
+        "spv": pd.read_excel(FILE_SPV, sheet_name=SHEET_SPV, engine="openpyxl"),
     }
 
 
@@ -356,14 +378,21 @@ def transform(raw: pd.DataFrame, masters: dict) -> pd.DataFrame:
     df["SUBPG1"] = df["SUBPG_SRC"]
     df = df.drop(columns=["SKU Code", "BRAND_SRC", "PG_SRC", "SUBPG_SRC"], errors="ignore")
 
-    # 4) CHANNEL, SPV, ASM, RSM dari CUSTOMER#
+    # 4) CHANNEL dari CUSTOMER#
     cust = _prepare_cust(masters["cust"])
     df = df.merge(cust, how="left", on="CUSTOMER#")
     df["CHANNEL"] = df["CHANNEL_SRC"]
+    df = df.drop(columns=["CHANNEL_SRC"], errors="ignore")
+
+    # 4b) SPV, ASM, RSM dari SDO (lookup spv_rsm.xlsx)
+    spv = _prepare_spv(masters["spv"])
+    df["_SDO_KEY"] = df["SDO"].astype(str).str.strip().str.upper()
+    df = df.merge(spv, how="left", on="_SDO_KEY")
     df["SPV"] = df["SPV_SRC"]
     df["ASM"] = df["ASM_SRC"]
     df["RSM"] = df["RSM_SRC"]
-    df = df.drop(columns=["CHANNEL_SRC", "SPV_SRC", "ASM_SRC", "RSM_SRC"], errors="ignore")
+    tidak_ada = df[df["SPV_SRC"].isna() & df["SDO"].notna()]
+    df = df.drop(columns=["_SDO_KEY", "SPV_SRC", "ASM_SRC", "RSM_SRC"], errors="ignore")
 
     # 5) REMARKS & CUST_TYPE
     df["REMARKS"] = df["NET VALUE2"].apply(_classify_remarks)
@@ -380,6 +409,10 @@ def transform(raw: pd.DataFrame, masters: dict) -> pd.DataFrame:
     # Info kelengkapan master
     print(f"   BRAND kosong  : {int(df['BRAND'].isna().sum()):,} baris (MATERIAL tidak ada di master SKU)")
     print(f"   CHANNEL kosong: {int(df['CHANNEL'].isna().sum()):,} baris (CUSTOMER# tidak ada di master customer)")
+    if len(tidak_ada):
+        top = tidak_ada["SDO"].value_counts()
+        print(f"   SPV/ASM/RSM kosong: {len(tidak_ada):,} baris dari {len(top)} SDO tidak ada di {FILE_SPV.name}")
+        print("      terbanyak: " + ", ".join(f"{n} ({c:,})" for n, c in top.head(8).items()))
     return df
 
 
